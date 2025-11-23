@@ -13,6 +13,7 @@ dependencies = [
     "torch",
     "numpy",
     "transformers",
+    "xxhash",
 ]
 requires-python = ">=3.9"
 

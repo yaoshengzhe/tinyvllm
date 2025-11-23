@@ -7,6 +7,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import fields
 from typing import AsyncGenerator
+from collections import deque
 
 import asyncio
 import os
@@ -14,6 +15,7 @@ import uuid
 from dataclasses import dataclass
 import torch
 import numpy as np
+import xxhash
 from transformers import AutoConfig
 
 DEFAULT_BLOCK_SIZE = 256
@@ -95,6 +97,7 @@ class Sequence:
         self.token_ids = token_ids
         self.params = params
         self.block_size = block_size
+        self.block_table: list[int] = []
 
     def __len__(self):
         return len(self.token_ids)
@@ -108,9 +111,109 @@ class Sequence:
         """Return the number of blocks needed for this sequence."""
         return (len(self.token_ids) + self.block_size - 1) // self.block_size
 
-    def block(self, idx: int) -> int:
+    def block(self, idx: int) -> list[int]:
         """Return the tokens in the specified block."""
         return self.token_ids[idx * self.block_size : (idx + 1) * self.block_size]
+
+
+@dataclass
+class Block:
+    block_id: int
+    ref_count: int = 0
+    hash: int = -1
+    token_ids: list[int] = None
+
+    def __len__(self):
+        return len(self.token_ids)
+
+    def __str__(self):
+        return f"Block(block_id={self.block_id}, ref_count={self.ref_count}, hash={self.hash}, token_ids={self.token_ids})"
+
+    def __eq__(self, other):
+        if not isinstance(other, Block):
+            return False
+        return self.block_id == other.block_id
+
+    def reset_states(self):
+        self.ref_count = 0
+        self.hash = -1
+        self.token_ids = []
+
+
+class BlockManager:
+    def __init__(self, num_blocks: int, block_size: int):
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.blocks = [Block(i) for i in range(num_blocks)]
+        self.hash_to_block_id: dict[int, int] = dict()
+        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        self.used_block_ids: set[int] = set()
+        self.stats = {
+            "cache_hit": 0,
+            "cache_miss": 0,
+        }
+
+    @classmethod
+    def _hash_tokens(cls, token_ids: list[int], prefix: int = -1):
+        h = xxhash.xxh64()
+        if prefix != -1:
+            h.update(prefix.to_bytes(8, "little"))
+        h.update(np.array(token_ids).tobytes())
+        return h.intdigest()
+
+    def _allocate_free_block(self, hash: int, token_ids: list[int]):
+        block_id = self.free_block_ids.popleft()
+        block = self.blocks[block_id]
+        # reset block
+        block.hash = hash
+        block.token_ids = token_ids
+        block.ref_count = 1
+        self.used_block_ids.add(block_id)
+        # only add to hash map if it's the current block for that hash
+        if hash != -1:
+            self.hash_to_block_id[hash] = block_id
+        return block
+
+    def _deallocate_block(self, block_id: int) -> Block:
+        self.used_block_ids.remove(block_id)
+        self.free_block_ids.append(block_id)
+        block = self.blocks[block_id]
+        if block.hash != -1:
+            # Only delete from hash map if it's the current block for that hash
+            if self.hash_to_block_id.get(block.hash) == block_id:
+                del self.hash_to_block_id[block.hash]
+        block.reset_states()
+        return block
+
+    def allocate(self, seq: Sequence):
+        h = -1
+        for i in range(seq.num_blocks()):
+            token_ids = seq.block(i)
+            h = self._hash_tokens(token_ids, h) if len(token_ids) == self.block_size else -1
+            block_id = self.hash_to_block_id.get(h, -1)
+            # If the block is already in the cache, reuse it
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                self.stats["cache_miss"] += 1
+                block = self._allocate_free_block(h, token_ids)
+            else:
+                self.stats["cache_hit"] += 1
+                if block_id in self.used_block_ids:
+                    block = self.blocks[block_id]
+                    block.ref_count += 1
+                else:
+                    # block is in free list
+                    block = self._allocate_free_block(h, token_ids)
+
+            seq.block_table.append(block.block_id)
+
+    def deallocate(self, seq: Sequence):
+        for block_id in reversed(seq.block_table):
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+        seq.block_table.clear()
 
 
 @dataclass
