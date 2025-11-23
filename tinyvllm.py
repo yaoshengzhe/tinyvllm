@@ -215,6 +215,37 @@ class BlockManager:
 
         seq.block_table.clear()
 
+    def can_allocate(self, seq: Sequence) -> bool:
+        return len(self.free_block_ids) >= seq.num_blocks()
+
+    def can_append(self, seq: Sequence) -> bool:
+        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+
+    def append_token(self, seq: Sequence):
+        """Handle block allocation/hashing when a token is appended to a sequence."""
+        block_table = seq.block_table
+        last_block_id = block_table[-1]
+        last_block = self.blocks[last_block_id]
+
+        if len(seq) % self.block_size == 1:
+            # New token started a new block.
+            # Allocate a fresh, unhashed block.
+            new_block = self._allocate_free_block(hash=-1, token_ids=[])
+            block_table.append(new_block.block_id)
+        elif len(seq) % self.block_size == 0:
+            # New token filled the current block.
+            # Hash the block and add to cache.
+            token_ids = seq.block(seq.num_blocks() - 1)
+            prefix_hash = -1
+            if len(block_table) > 1:
+                prefix_hash = self.blocks[block_table[-2]].hash
+
+            h = self._hash_tokens(token_ids, prefix_hash)
+            last_block.hash = h
+            last_block.token_ids = token_ids
+            self.hash_to_block_id[h] = last_block.block_id
+        # Else: token added to partial block, no action needed until full.
+
 
 @dataclass
 class CompletionOutput:
@@ -290,3 +321,55 @@ class AsyncLLMEngine(BaseLLMEngine):
 
 class LLM(AsyncLLMEngine):
     pass
+
+
+class Scheduler:
+    def __init__(self, config: Config):
+        self.max_num_seqs = config.max_num_seqs
+        self.max_num_batched_tokens = config.max_num_batched_tokens
+
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.waiting: deque[Sequence] = deque()
+        self.running: deque[Sequence] = deque()
+
+    def add(self, seq: Sequence):
+        self.waiting.append(seq)
+    
+    def schedule(self) -> tuple[list[Sequence], bool]:
+        scheduled_seqs = []
+        # Append new sequences to running
+        while self.waiting and self._add_new_seq(self.waiting[0], scheduled_seqs):
+            pass
+    
+        if scheduled_seqs:
+            return scheduled_seqs, True
+
+        # Schedule sequences in running
+        while self.running:
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                self.block_manager.append_token(seq)
+                scheduled_seqs.append(seq)
+
+        self.running.extendleft(reversed(scheduled_seqs))
+        return scheduled_seqs, False
+
+    def preempt(self, seq: Sequence):
+        self.block_manager.deallocate(seq)
+        self.waiting.appendleft(seq)
+
+    def _add_new_seq(self, seq: Sequence, scheduled_seqs: list[Sequence]):
+        if not self.block_manager.can_allocate(seq):
+            return False
+        
+        self.block_manager.allocate(seq)
+        self.waiting.popleft()
+        self.running.append(seq)
+        scheduled_seqs.append(seq)
+        return True
