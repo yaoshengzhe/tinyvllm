@@ -17,7 +17,8 @@ prompts = [
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Initialize the LLM engine with the Qwen model
-llm = LLM(model="Qwen/Qwen3-0.6B")
+# huggingface-cli download Qwen/Qwen3-0.6B --local-dir models/Qwen3-0.6B --local-dir-use-symlinks False
+llm = LLM(model="models/Qwen3-0.6B")
 
 # Generate outputs for the input prompts
 outputs = llm.generate(prompts, sampling_params)

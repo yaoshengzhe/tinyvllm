@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinyvllm"
+version = "0.1.0"
+description = "A tiny version of vllm inspired by nano-vllm"
+authors = [
+    {name = "Shengzhe", email = "yaoshengzhe@gmail.com"},
+]
+dependencies = [
+    "torch",
+    "numpy",
+    "transformers",
+]
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]

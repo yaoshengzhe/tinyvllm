@@ -1,5 +1,0 @@
-torch
-transformers
-numpy
-huggingface_hub
-protobuf<5
