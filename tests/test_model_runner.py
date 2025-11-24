@@ -69,8 +69,8 @@ class TestModelRunner(unittest.TestCase):
         
         input_ids, positions, attention_mask = self.runner.prepare_decode([seq1, seq2])
         
-        self.assertEqual(input_ids.tolist(), [[1, 2, 3], [4, 5, 0]])
-        self.assertEqual(positions.tolist(), [3, 2])
+        self.assertEqual(input_ids.tolist(), [[1, 2, 3, 4], [5, 6, 7, 0]])
+        self.assertEqual(positions.tolist(), [[0, 1, 2, 3], [0, 1, 2, 0]])
         
         from tinyvllm import get_context
         context = get_context()
@@ -111,10 +111,10 @@ class TestModelRunner(unittest.TestCase):
         seq2 = Sequence(2, [1, 2, 3, 4, 5], block_size=4)
         seq2.block_table = [11, 12]
         
-        input_ids, positions = self.runner.prepare_decode([seq1, seq2])
+        input_ids, positions, attention_mask = self.runner.prepare_decode([seq1, seq2])
         
-        self.assertEqual(input_ids.tolist(), [4, 5])
-        self.assertEqual(positions.tolist(), [3, 4])
+        self.assertEqual(input_ids.tolist(), [[1, 2, 3, 4, 0], [1, 2, 3, 4, 5]])
+        self.assertEqual(positions.tolist(), [[0, 1, 2, 3, 0], [0, 1, 2, 3, 4]])
         
         from tinyvllm import get_context
         context = get_context()

@@ -141,7 +141,7 @@ def main():
     print(f"Output Length: up to {args.max_output_len}")
     
     prompt_token_ids = [
-        [randint(0, 10000) for _ in range(randint(100, args.max_input_len))] 
+        [randint(0, 10000) for _ in range(randint(1, args.max_input_len))] 
         for _ in range(args.num_seqs)
     ]
     
@@ -150,7 +150,7 @@ def main():
         SamplingParams(
             temperature=0.6, 
             ignore_eos=True, 
-            max_tokens=randint(100, args.max_output_len)
+            max_tokens=randint(1, args.max_output_len)
         ) 
         for _ in range(args.num_seqs)
     ]

@@ -32,6 +32,41 @@ huggingface-cli download Qwen/Qwen3-0.6B
 python example.py
 ```
 
+## Running on Laptop (macOS/CPU)
+
+`tinyvllm` is designed to be compatible with macOS and CPU-only environments, although performance will be slower than on GPU.
+
+### Prerequisites
+
+Ensure you have Python 3.8+ installed. It is recommended to use a virtual environment.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Running the Example
+
+1.  **Download the model** (if not already done):
+    ```bash
+    huggingface-cli download Qwen/Qwen3-0.6B --local-dir models/Qwen3-0.6B --local-dir-use-symlinks False
+    ```
+
+2.  **Run the example**:
+    ```bash
+    python example.py
+    ```
+    On a laptop, it might take a minute to load the model and generate text.
+
+### Running Benchmarks on Laptop
+
+You can run the benchmark on your laptop with reduced parameters for testing:
+
+```bash
+python benchmark.py --backend tinyvllm --num-seqs 2 --max-input-len 10 --max-output-len 10
+```
+
 ## Benchmark
 
 To benchmark vLLM performance (requires `vllm` installed):
@@ -44,6 +79,12 @@ To benchmark nano-vLLM performance (requires `nanovllm` installed):
 
 ```bash
 python benchmark.py --backend nanovllm
+```
+
+To benchmark tinyvllm performance:
+
+```bash
+python benchmark.py --backend tinyvllm
 ```
 
 ### Comparative Results

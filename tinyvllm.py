@@ -109,10 +109,11 @@ class Config:
 class SamplingParams:
     """Sampling parameters for generation."""
 
-    def __init__(self, temperature=1.0, top_p=1.0, max_tokens=16):
+    def __init__(self, temperature=1.0, top_p=1.0, max_tokens=16, ignore_eos=False):
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
+        self.ignore_eos = ignore_eos
 
 
 class Sequence:
@@ -356,7 +357,7 @@ class BaseLLMEngine(ABC):
 
     @abstractmethod
     def generate(
-        self, prompt: list[str], sampling_params: SamplingParams
+        self, prompts: list[str] | list[list[int]], sampling_params: SamplingParams | list[SamplingParams]
     ) -> list[RequestOutput]:
         """Generate outputs for the given prompts."""
         raise NotImplementedError(f"{type(self)} is not implemented")
@@ -389,7 +390,7 @@ class AsyncLLMEngine(BaseLLMEngine):
             process.join()
 
     def generate(
-        self, prompts: list[str], sampling_params: SamplingParams
+        self, prompts: list[str] | list[list[int]], sampling_params: SamplingParams | list[SamplingParams], use_tqdm: bool = False
     ) -> list[RequestOutput]:
         async def _collect_results():
             results = []
@@ -400,7 +401,7 @@ class AsyncLLMEngine(BaseLLMEngine):
         return asyncio.run(_collect_results())
 
     async def generate_async(
-        self, prompts: list[str], sampling_params: SamplingParams
+        self, prompts: list[str] | list[list[int]], sampling_params: SamplingParams | list[SamplingParams]
     ) -> AsyncGenerator[list[RequestOutput], None]:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
@@ -416,9 +417,12 @@ class AsyncLLMEngine(BaseLLMEngine):
                 # Let's yield current outputs.
                 request_outputs = []
                 for seq, completion_token_ids in outputs:
+                    prompt_text = prompts[seq.id]
+                    if isinstance(prompt_text, list):
+                        prompt_text = self.tokenizer.decode(prompt_text)
                     request_outputs.append(
                         RequestOutput(
-                            seq.id, prompts[seq.id], [CompletionOutput(0, self.tokenizer.decode(completion_token_ids), [])]
+                            seq.id, prompt_text, [CompletionOutput(0, self.tokenizer.decode(completion_token_ids), completion_token_ids)]
                         )
                     )
                 yield request_outputs
@@ -550,19 +554,24 @@ class ModelRunner(BaseModelRunner):
         self.device = device
 
         default_dtype = torch.get_default_dtype()
-        if hf_config and hasattr(hf_config, "torch_dtype") and hf_config.torch_dtype:
-            torch.set_default_dtype(hf_config.torch_dtype)
+        if hf_config:
+            dtype = getattr(hf_config, "torch_dtype", None) or getattr(hf_config, "dtype", None)
+            if dtype:
+                torch.set_default_dtype(dtype)
         
         if torch.cuda.is_available():
             torch.set_default_device("cuda")
         
         # Fallback to AutoModelForCausalLM if Qwen3ForCausalLM is not available
+        import warnings
         from transformers import AutoModelForCausalLM
-        self.model = AutoModelForCausalLM.from_pretrained(
-            config.model,
-            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map={"": device} if torch.cuda.is_available() else None
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                config.model,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map={"": device} if torch.cuda.is_available() else None
+            )
         self.sampler = Sampler()
         
         if torch.cuda.is_available():
@@ -658,11 +667,12 @@ class ModelRunner(BaseModelRunner):
         
         # Approximate dtype size if not available
         dtype_size = 2 # Default to float16
-        if hasattr(hf_config, "torch_dtype") and hf_config.torch_dtype:
+        dtype = getattr(hf_config, "torch_dtype", None) or getattr(hf_config, "dtype", None)
+        if dtype:
             try:
-                dtype_size = torch.tensor([], dtype=hf_config.torch_dtype).element_size()
+                dtype_size = torch.tensor([], dtype=dtype).element_size()
             except:
-                pass
+                dtype_size = 2 # Default to 2 bytes (float16) if unknown
 
         num_layers = hf_config.num_hidden_layers
         block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * dtype_size
