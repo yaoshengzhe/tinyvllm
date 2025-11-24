@@ -92,18 +92,24 @@ def paged_attention_forward(self, *args, **kwargs):
         
         slots = context.slot_mapping
         if slots.shape[0] == k_flat.shape[0]:
-            # Calculate block index and offset
+            # Vectorized storage for CUDA Graph compatibility
+            num_blocks = kv_cache.shape[2]
             block_size = kv_cache.shape[3]
-            block_ids = slots // block_size
-            offsets = slots % block_size
+            num_kv_heads = kv_cache.shape[4]
+            head_dim = kv_cache.shape[5]
             
-            # This is slow in Python, but works for now.
-            # Optimized version would use custom kernel or scatter.
-            for i in range(slots.shape[0]):
-                bid = block_ids[i]
-                off = offsets[i]
-                kv_cache[0, layer_id, bid, off] = k_flat[i]
-                kv_cache[1, layer_id, bid, off] = v_flat[i]
+            # Flattened view for indexing
+            # kv_cache[0, layer_id] shape: [num_blocks, block_size, num_kv_heads, head_dim]
+            k_cache_flat = kv_cache[0, layer_id].view(num_blocks * block_size, num_kv_heads, head_dim)
+            v_cache_flat = kv_cache[1, layer_id].view(num_blocks * block_size, num_kv_heads, head_dim)
+            
+            # slots is [total_tokens]
+            # Mask out invalid slots (e.g., -1 during padding in CUDA graph)
+            # In CUDA graphs, we cannot use boolean indexing as it creates dynamic shapes.
+            # We assume slots contains valid indices (>=0). During capture, it's filled with 0s.
+            # If there are -1s, this will raise an error, which is better than crashing the graph.
+            k_cache_flat[slots] = k_flat.to(k_cache_flat.dtype)
+            v_cache_flat[slots] = v_flat.to(v_cache_flat.dtype)
 
         # Paged Attention (Retrieve and Compute)
         if context.block_tables is not None:
@@ -111,58 +117,66 @@ def paged_attention_forward(self, *args, **kwargs):
             # q is [b, num_heads, 1, head_dim]
             # We need to collect K, V for all past tokens for each sequence in batch.
             
-            output = torch.empty_like(q) # [b, num_heads, 1, head_dim]
+            # Optimized Batched Attention using gathering and masking
+            # This is compatible with CUDA graphs as it has static shapes and no dynamic control flow.
             
-            for i in range(b):
-                # Get block table for this sequence
-                block_table = context.block_tables[i] # [max_num_blocks]
-                actual_len = context.context_lens[i]
-                
-                # Collect K, V blocks
-                # This is also slow in Python.
-                num_blocks = (actual_len + block_size - 1) // block_size
-                valid_blocks = block_table[:num_blocks]
-                
-                # Gather blocks
-                # kv_cache[0, layer_id, valid_blocks] -> [num_blocks, block_size, num_kv_heads, head_dim]
-                k_blocks = kv_cache[0, layer_id, valid_blocks]
-                v_blocks = kv_cache[1, layer_id, valid_blocks]
-                
-                # Flatten blocks and truncate to actual_len
-                k_full = k_blocks.view(-1, num_kv_heads, head_dim)[:actual_len]
-                v_full = v_blocks.view(-1, num_kv_heads, head_dim)[:actual_len]
-                
-                # Compute attention for this sequence
-                # q_i is [num_heads, 1, head_dim]
-                q_i = q[i] 
-                
-                # Repeat K, V for GQA if needed
-                # num_heads = 16, num_kv_heads = 8. Repeat factor = 2.
-                if num_heads != num_kv_heads:
-                    k_full = k_full.repeat_interleave(num_heads // num_kv_heads, dim=1)
-                    v_full = v_full.repeat_interleave(num_heads // num_kv_heads, dim=1)
-                
-                # k_full is [actual_len, num_heads, head_dim]
-                # v_full is [actual_len, num_heads, head_dim]
-                
-                # Attention scores
-                # q_i: [num_heads, 1, head_dim]
-                # k_full: [actual_len, num_heads, head_dim] -> [num_heads, actual_len, head_dim]
-                scores = torch.matmul(q_i, k_full.transpose(0, 1).transpose(1, 2)) / (head_dim ** 0.5)
-                # scores is [num_heads, 1, actual_len]
-                
-                if attention_mask is not None:
-                    # Handle mask if needed, but for decode it's usually all 1s for past
-                    pass
-                
-                probs = torch.softmax(scores, dim=-1)
-                
-                # Output
-                # probs: [num_heads, 1, actual_len]
-                # v_full: [num_heads, actual_len, head_dim]
-                out_i = torch.matmul(probs, v_full.transpose(0, 1))
-                # out_i is [num_heads, 1, head_dim]
-                output[i] = out_i
+            # 1. Gather all potential blocks for all sequences in batch
+            # block_tables: [bs, max_num_blocks_per_seq]
+            # kv_cache[0, layer_id]: [num_total_blocks, block_size, num_kv_heads, head_dim]
+            
+            # Gather K and V blocks
+            # Result shape: [bs, max_num_blocks_per_seq, block_size, num_kv_heads, head_dim]
+            k_all_blocks = kv_cache[0, layer_id, context.block_tables]
+            v_all_blocks = kv_cache[1, layer_id, context.block_tables]
+            
+            bs, max_num_blocks, block_size, num_kv_heads, head_dim = k_all_blocks.shape
+            
+            # 2. Flatten blocks to sequence dimension
+            # Shape: [bs, max_num_blocks * block_size, num_kv_heads, head_dim]
+            k_full = k_all_blocks.view(bs, max_num_blocks * block_size, num_kv_heads, head_dim)
+            v_full = v_all_blocks.view(bs, max_num_blocks * block_size, num_kv_heads, head_dim)
+            
+            # 3. Create attention mask based on context_lens
+            # context_lens: [bs]
+            # range_tensor: [1, max_num_blocks * block_size]
+            seq_len_dim = max_num_blocks * block_size
+            range_tensor = torch.arange(seq_len_dim, device=q.device).unsqueeze(0)
+            
+            # Mask shape: [bs, 1, 1, seq_len_dim]
+            attn_mask = (range_tensor < context.context_lens.unsqueeze(1)).unsqueeze(1).unsqueeze(1)
+            
+            # Convert boolean mask to float mask (0 for valid, -inf for invalid)
+            attn_mask = attn_mask.to(q.dtype)
+            attn_mask = (1.0 - attn_mask) * float("-inf")
+            
+            # 4. Prepare for attention
+            # q: [b, num_heads, 1, head_dim]
+            # k_full: [b, seq_len_dim, num_kv_heads, head_dim]
+            
+            # Repeat K, V for GQA if needed
+            if num_heads != num_kv_heads:
+                k_full = k_full.repeat_interleave(num_heads // num_kv_heads, dim=2)
+                v_full = v_full.repeat_interleave(num_heads // num_kv_heads, dim=2)
+            
+            # Reshape K, V for attention: [b, num_heads, seq_len_dim, head_dim]
+            k_full = k_full.transpose(1, 2)
+            v_full = v_full.transpose(1, 2)
+            
+            # Batched attention scores
+            # q: [b, num_heads, 1, head_dim]
+            # k_full.transpose(-2, -1): [b, num_heads, head_dim, seq_len_dim]
+            scores = torch.matmul(q, k_full.transpose(-2, -1)) / (head_dim ** 0.5)
+            # scores: [b, num_heads, 1, seq_len_dim]
+            
+            scores = scores + attn_mask
+            probs = torch.softmax(scores, dim=-1)
+            
+            # Handle potential NaNs if all masked (though unlikely in decode)
+            # probs = torch.nan_to_num(probs, nan=0.0)
+            
+            # Output
+            output = torch.matmul(probs, v_full)
+            # output: [b, num_heads, 1, head_dim]
             
             output = output.transpose(1, 2).reshape(b, s, -1)
             output = self.o_proj(output)
