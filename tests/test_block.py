@@ -49,7 +49,7 @@ class TestBlockManager(unittest.TestCase):
         self.assertNotEqual(h1, h3)
 
     def test_allocate_new_blocks(self):
-        seq = Sequence(token_ids=[1, 2, 3, 4, 5], block_size=self.block_size)
+        seq = Sequence(1, token_ids=[1, 2, 3, 4, 5], block_size=self.block_size)
         self.bm.allocate(seq)
         
         self.assertEqual(len(seq.block_table), 2)
@@ -65,10 +65,10 @@ class TestBlockManager(unittest.TestCase):
         self.assertEqual(block1.ref_count, 1)
 
     def test_allocate_cached_blocks(self):
-        seq1 = Sequence(token_ids=[1, 2, 3, 4], block_size=self.block_size)
+        seq1 = Sequence(1, token_ids=[1, 2, 3, 4], block_size=self.block_size)
         self.bm.allocate(seq1)
         
-        seq2 = Sequence(token_ids=[1, 2, 3, 4], block_size=self.block_size)
+        seq2 = Sequence(2, token_ids=[1, 2, 3, 4], block_size=self.block_size)
         self.bm.allocate(seq2)
         
         self.assertEqual(self.bm.stats["cache_miss"], 1)
@@ -77,7 +77,7 @@ class TestBlockManager(unittest.TestCase):
         self.assertEqual(self.bm.blocks[seq1.block_table[0]].ref_count, 2)
 
     def test_deallocate(self):
-        seq = Sequence(token_ids=[1, 2, 3, 4], block_size=self.block_size)
+        seq = Sequence(1, token_ids=[1, 2, 3, 4], block_size=self.block_size)
         self.bm.allocate(seq)
         block_id = seq.block_table[0]
         
@@ -88,9 +88,9 @@ class TestBlockManager(unittest.TestCase):
         self.assertNotIn(block_id, self.bm.used_block_ids)
 
     def test_deallocate_shared_block(self):
-        seq1 = Sequence(token_ids=[1, 2, 3, 4], block_size=self.block_size)
+        seq1 = Sequence(1, token_ids=[1, 2, 3, 4], block_size=self.block_size)
         self.bm.allocate(seq1)
-        seq2 = Sequence(token_ids=[1, 2, 3, 4], block_size=self.block_size)
+        seq2 = Sequence(2, token_ids=[1, 2, 3, 4], block_size=self.block_size)
         self.bm.allocate(seq2)
         
         block_id = seq1.block_table[0]
@@ -102,22 +102,22 @@ class TestBlockManager(unittest.TestCase):
 
     def test_out_of_memory(self):
         # Allocate all blocks
-        seq1 = Sequence(token_ids=[1] * (self.num_blocks * self.block_size), block_size=self.block_size)
+        seq1 = Sequence(1, token_ids=[1] * (self.num_blocks * self.block_size), block_size=self.block_size)
         self.bm.allocate(seq1)
         self.assertEqual(len(self.bm.used_block_ids), self.num_blocks)
         self.assertEqual(len(self.bm.free_block_ids), 0)
         
         # Try to allocate one more block
-        seq2 = Sequence(token_ids=[1], block_size=self.block_size)
+        seq2 = Sequence(2, token_ids=[1], block_size=self.block_size)
         with self.assertRaises(IndexError):
             self.bm.allocate(seq2)
 
     def test_partial_blocks_not_shared_if_different(self):
         # Partial blocks (length < block_size) should not be shared if they differ
-        seq1 = Sequence(token_ids=[1, 2], block_size=self.block_size) # partial
+        seq1 = Sequence(1, token_ids=[1, 2], block_size=self.block_size) # partial
         self.bm.allocate(seq1)
         
-        seq2 = Sequence(token_ids=[1, 3], block_size=self.block_size) # partial, different
+        seq2 = Sequence(2, token_ids=[1, 3], block_size=self.block_size) # partial, different
         self.bm.allocate(seq2)
         
         self.assertNotEqual(seq1.block_table[0], seq2.block_table[0])
@@ -127,10 +127,10 @@ class TestBlockManager(unittest.TestCase):
     def test_mixed_sharing(self):
         # seq1: [1, 2, 3, 4], [5, 6]
         # seq2: [1, 2, 3, 4], [7, 8]
-        seq1 = Sequence(token_ids=[1, 2, 3, 4, 5, 6], block_size=self.block_size)
+        seq1 = Sequence(1, token_ids=[1, 2, 3, 4, 5, 6], block_size=self.block_size)
         self.bm.allocate(seq1)
         
-        seq2 = Sequence(token_ids=[1, 2, 3, 4, 7, 8], block_size=self.block_size)
+        seq2 = Sequence(2, token_ids=[1, 2, 3, 4, 7, 8], block_size=self.block_size)
         self.bm.allocate(seq2)
         
         # First block should be shared
@@ -143,7 +143,7 @@ class TestBlockManager(unittest.TestCase):
         self.assertEqual(self.bm.blocks[seq2.block_table[1]].ref_count, 1)
 
     def test_reallocation_after_deallocation(self):
-        seq1 = Sequence(token_ids=[1, 2, 3, 4], block_size=self.block_size)
+        seq1 = Sequence(1, token_ids=[1, 2, 3, 4], block_size=self.block_size)
         self.bm.allocate(seq1)
         block_id = seq1.block_table[0]
         self.bm.deallocate(seq1)
@@ -153,7 +153,7 @@ class TestBlockManager(unittest.TestCase):
         # Since it's in free list, it might be reused but needs re-initialization or check.
         # In our current impl, deallocate calls reset_states, so it loses hash and tokens.
         
-        seq2 = Sequence(token_ids=[1, 2, 3, 4], block_size=self.block_size)
+        seq2 = Sequence(2, token_ids=[1, 2, 3, 4], block_size=self.block_size)
         self.bm.allocate(seq2)
         
         # It should get a block, possibly the same ID if it's LIFO or FIFO, 
@@ -175,10 +175,10 @@ class TestBlockManager(unittest.TestCase):
         try:
             BlockManager._hash_tokens = lambda cls, tokens, prefix=-1: 12345 # Constant hash
             
-            seq1 = Sequence(token_ids=[1, 2, 3, 4], block_size=self.block_size)
+            seq1 = Sequence(1, token_ids=[1, 2, 3, 4], block_size=self.block_size)
             self.bm.allocate(seq1)
             
-            seq2 = Sequence(token_ids=[5, 6, 7, 8], block_size=self.block_size)
+            seq2 = Sequence(2, token_ids=[5, 6, 7, 8], block_size=self.block_size)
             self.bm.allocate(seq2)
             
             # Should not share even if hash is same, because tokens differ
@@ -191,9 +191,9 @@ class TestBlockManager(unittest.TestCase):
         # Seq1: [B1, B2, B3]
         # Seq2: [B1, B2, B4]
         # Seq3: [B1, B5, B6]
-        self.bm.allocate(Sequence(token_ids=[1]*4 + [2]*4 + [3]*4, block_size=4)) # Seq1
-        self.bm.allocate(Sequence(token_ids=[1]*4 + [2]*4 + [4]*4, block_size=4)) # Seq2
-        self.bm.allocate(Sequence(token_ids=[1]*4 + [5]*4 + [6]*4, block_size=4)) # Seq3
+        self.bm.allocate(Sequence(1, token_ids=[1]*4 + [2]*4 + [3]*4, block_size=4)) # Seq1
+        self.bm.allocate(Sequence(2, token_ids=[1]*4 + [2]*4 + [4]*4, block_size=4)) # Seq2
+        self.bm.allocate(Sequence(3, token_ids=[1]*4 + [5]*4 + [6]*4, block_size=4)) # Seq3
         
         # B1 (tokens [1]*4) should have ref_count 3
         # B2 (tokens [2]*4) should have ref_count 2
@@ -208,9 +208,9 @@ class TestBlockManager(unittest.TestCase):
         # Deallocate Seq1
         # Need to keep track of seqs to deallocate them. Let's re-do with variables.
         self.bm = BlockManager(num_blocks=10, block_size=4) # Reset
-        seq1 = Sequence(token_ids=[1]*4 + [2]*4 + [3]*4, block_size=4)
-        seq2 = Sequence(token_ids=[1]*4 + [2]*4 + [4]*4, block_size=4)
-        seq3 = Sequence(token_ids=[1]*4 + [5]*4 + [6]*4, block_size=4)
+        seq1 = Sequence(1, token_ids=[1]*4 + [2]*4 + [3]*4, block_size=4)
+        seq2 = Sequence(2, token_ids=[1]*4 + [2]*4 + [4]*4, block_size=4)
+        seq3 = Sequence(3, token_ids=[1]*4 + [5]*4 + [6]*4, block_size=4)
         self.bm.allocate(seq1)
         self.bm.allocate(seq2)
         self.bm.allocate(seq3)
@@ -229,7 +229,7 @@ class TestBlockManager(unittest.TestCase):
         # Fill up memory
         seqs = []
         for i in range(self.num_blocks):
-            seq = Sequence(token_ids=[i]*self.block_size, block_size=self.block_size)
+            seq = Sequence(i, token_ids=[i]*self.block_size, block_size=self.block_size)
             self.bm.allocate(seq)
             seqs.append(seq)
         
@@ -244,17 +244,17 @@ class TestBlockManager(unittest.TestCase):
         
         # Allocate new blocks, should succeed
         for i in range(self.num_blocks // 2):
-            seq = Sequence(token_ids=[100+i]*self.block_size, block_size=self.block_size)
+            seq = Sequence(100+i, token_ids=[100+i]*self.block_size, block_size=self.block_size)
             self.bm.allocate(seq)
             self.assertEqual(len(seq.block_table), 1)
 
     def test_partial_block_not_cached_even_if_same_content(self):
         # Partial blocks should not be cached/shared even if content is same, 
         # because they are not hashed.
-        seq1 = Sequence(token_ids=[1, 2], block_size=4)
+        seq1 = Sequence(1, token_ids=[1, 2], block_size=4)
         self.bm.allocate(seq1)
         
-        seq2 = Sequence(token_ids=[1, 2], block_size=4)
+        seq2 = Sequence(2, token_ids=[1, 2], block_size=4)
         self.bm.allocate(seq2)
         
         self.assertNotEqual(seq1.block_table[0], seq2.block_table[0])

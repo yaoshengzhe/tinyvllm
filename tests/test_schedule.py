@@ -13,13 +13,13 @@ class TestScheduler(unittest.TestCase):
         self.scheduler = Scheduler(self.config)
 
     def test_add_sequence(self):
-        seq = Sequence(token_ids=[1, 2, 3], block_size=4)
+        seq = Sequence(1, token_ids=[1, 2, 3], block_size=4)
         self.scheduler.add(seq)
         self.assertEqual(len(self.scheduler.waiting), 1)
         self.assertEqual(len(self.scheduler.running), 0)
 
     def test_schedule_new_sequence_success(self):
-        seq = Sequence(token_ids=[1, 2, 3], block_size=4)
+        seq = Sequence(1, token_ids=[1, 2, 3], block_size=4)
         self.scheduler.add(seq)
         scheduled, is_prefill = self.scheduler.schedule()
         self.assertTrue(is_prefill)
@@ -31,7 +31,7 @@ class TestScheduler(unittest.TestCase):
     def test_schedule_new_sequence_insufficient_memory(self):
         # Fill up memory
         self.scheduler.block_manager.free_block_ids.clear() # Force OOM
-        seq = Sequence(token_ids=[1, 2, 3], block_size=4)
+        seq = Sequence(1, token_ids=[1, 2, 3], block_size=4)
         self.scheduler.add(seq)
         scheduled, is_prefill = self.scheduler.schedule()
         self.assertFalse(is_prefill) # Returns False because scheduled_seqs is empty and falls through to generation
@@ -40,7 +40,7 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(len(self.scheduler.running), 0)
 
     def test_schedule_generation_success(self):
-        seq = Sequence(token_ids=[1, 2, 3], block_size=4)
+        seq = Sequence(1, token_ids=[1, 2, 3], block_size=4)
         self.scheduler.add(seq)
         self.scheduler.schedule() # Prefill
         
@@ -63,7 +63,7 @@ class TestScheduler(unittest.TestCase):
         # Setup: 1 block available. 
         # Seq1 takes 1 block.
         self.scheduler.block_manager = BlockManager(num_blocks=1, block_size=4)
-        seq1 = Sequence(token_ids=[1, 2, 3, 4], block_size=4)
+        seq1 = Sequence(1, token_ids=[1, 2, 3, 4], block_size=4)
         self.scheduler.add(seq1)
         self.scheduler.schedule() # Prefill, takes the only block
         
@@ -81,8 +81,8 @@ class TestScheduler(unittest.TestCase):
     def test_schedule_preemption_other(self):
         # Setup: 2 blocks available.
         self.scheduler.block_manager = BlockManager(num_blocks=2, block_size=4)
-        seq1 = Sequence(token_ids=[1, 2, 3, 4], block_size=4)
-        seq2 = Sequence(token_ids=[5, 6, 7, 8], block_size=4)
+        seq1 = Sequence(1, token_ids=[1, 2, 3, 4], block_size=4)
+        seq2 = Sequence(2, token_ids=[5, 6, 7, 8], block_size=4)
         self.scheduler.add(seq1)
         self.scheduler.add(seq2)
         self.scheduler.schedule() # Prefill both, uses 2 blocks.
@@ -106,6 +106,24 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(self.scheduler.running[0], seq1)
         self.assertEqual(len(self.scheduler.waiting), 1)
         self.assertEqual(self.scheduler.waiting[0], seq2)
+
+    def test_update_seqs(self):
+        # Mock END_OF_SEQ_TOKEN
+        with patch('tinyvllm.END_OF_SEQ_TOKEN', -1):
+            seq = Sequence(1, token_ids=[1, 2, 3], block_size=4)
+            self.scheduler.add(seq)
+            self.scheduler.schedule() # Prefill
+            
+            # Update with normal token
+            self.scheduler.update_seqs([seq], [4])
+            self.assertEqual(seq.token_ids, [1, 2, 3, 4])
+            self.assertEqual(len(self.scheduler.running), 1)
+            
+            # Update with end token
+            self.scheduler.update_seqs([seq], [-1])
+            self.assertEqual(seq.token_ids, [1, 2, 3, 4, -1])
+            self.assertEqual(len(self.scheduler.running), 0)
+            self.assertEqual(len(seq.block_table), 0) # Deallocated
 
 if __name__ == '__main__':
     unittest.main()

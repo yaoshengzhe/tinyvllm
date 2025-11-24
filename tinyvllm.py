@@ -5,9 +5,11 @@ tinyvllm - A tiny version of vllm inspired by nano-vllm.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import fields
-from typing import AsyncGenerator
 from collections import deque
+from dataclasses import fields
+from transformers import AutoTokenizer
+from typing import AsyncGenerator
+
 
 import asyncio
 import os
@@ -19,6 +21,7 @@ import xxhash
 from transformers import AutoConfig
 
 DEFAULT_BLOCK_SIZE = 256
+END_OF_SEQ_TOKEN = -1
 
 
 @dataclass
@@ -89,13 +92,15 @@ class Sequence:
 
     def __init__(
         self,
+        seq_id: int,
         token_ids: list[int],
         params: SamplingParams = None,
         block_size: int = DEFAULT_BLOCK_SIZE,
     ):
-        self.id = uuid.uuid4().hex
+        self.id = seq_id
         self.token_ids = token_ids
         self.params = params
+        self.num_prompt_tokens = len(token_ids)
         self.block_size = block_size
         self.block_table: list[int] = []
 
@@ -107,6 +112,14 @@ class Sequence:
             f"Sequence(id={self.id}, token_ids={self.token_ids}, params={self.params})"
         )
 
+    @property
+    def completion_token_ids(self) -> list[int]:
+        return self.token_ids[self.num_prompt_tokens:]
+
+    @property
+    def is_finished(self) -> bool:
+        return len(self.token_ids) > self.num_prompt_tokens and self.token_ids[-1] == END_OF_SEQ_TOKEN
+
     def num_blocks(self) -> int:
         """Return the number of blocks needed for this sequence."""
         return (len(self.token_ids) + self.block_size - 1) // self.block_size
@@ -114,6 +127,9 @@ class Sequence:
     def block(self, idx: int) -> list[int]:
         """Return the tokens in the specified block."""
         return self.token_ids[idx * self.block_size : (idx + 1) * self.block_size]
+
+    def append_token(self, token_id: int):
+        self.token_ids.append(token_id)
 
 
 @dataclass
@@ -296,6 +312,26 @@ class AsyncLLMEngine(BaseLLMEngine):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         self.config = Config(model, **config_kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model, use_fast=True)
+        self.scheduler = Scheduler(self.config)
+
+        self.ps = []
+        events = []
+        ctx = torch.multiprocessing.get_context("spawn")
+        for i in range(1, self.config.tensor_parallel_size):
+            event = ctx.Event()
+            process = ctx.Process(target=ModelRunner, args=(self.config, i, event))
+            process.start()
+            self.ps.append(process)
+            events.append(event)
+
+        self.model_runner = ModelRunner(self.config, 0, events)
+
+    def exit(self):
+        self.model_runner.exit()
+        del self.model_runner
+        for process in self.ps:
+            process.join()
 
     def generate(
         self, prompts: list[str], sampling_params: SamplingParams
@@ -311,13 +347,43 @@ class AsyncLLMEngine(BaseLLMEngine):
     async def generate_async(
         self, prompts: list[str], sampling_params: SamplingParams
     ) -> AsyncGenerator[list[RequestOutput], None]:
-        yield [
-            RequestOutput(
-                uuid.uuid4().hex, prompt, [CompletionOutput(0, "Hello World", [])]
-            )
-            for prompt in prompts
-        ]
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        
+        for i, (prompt, sampling_param) in enumerate(zip(prompts, sampling_params)):
+            self.add_request(i, prompt, sampling_param)
+        
+        while not self.scheduler.is_finished():
+            outputs, _ = self.step()
+            if outputs:
+                # For now, just collect and yield at the end, or yield per step?
+                # The current signature yields list[RequestOutput].
+                # Let's yield current outputs.
+                request_outputs = []
+                for seq, completion_token_ids in outputs:
+                    request_outputs.append(
+                        RequestOutput(
+                            seq.id, prompts[seq.id], [CompletionOutput(0, self.tokenizer.decode(completion_token_ids), [])]
+                        )
+                    )
+                yield request_outputs
 
+    def add_request(self, seq_id: int, prompt: str | list[int], sampling_params: SamplingParams):
+        if isinstance(prompt, str):
+            token_ids = self.tokenizer.encode(prompt)
+        else:
+            token_ids = prompt
+        
+        seq = Sequence(seq_id, token_ids, sampling_params)
+        self.scheduler.add(seq)
+
+    def step(self):
+        seqs, is_prefill = self.scheduler.schedule()
+        token_ids = self.model_runner.run(seqs, is_prefill)
+        self.scheduler.update_seqs(seqs, token_ids)
+        outputs = [(seq, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        return outputs, num_tokens
 
 class LLM(AsyncLLMEngine):
     pass
@@ -335,6 +401,9 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
     
+    def is_finished(self):
+        return not self.waiting and not self.running
+
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         # Append new sequences to running
@@ -364,6 +433,13 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
+    def update_seqs(self, seqs: list[Sequence], token_ids: list[int]):
+        for seq, token_id in zip(seqs, token_ids):
+            seq.append_token(token_id)
+            if token_id == END_OF_SEQ_TOKEN:
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+
     def _add_new_seq(self, seq: Sequence, scheduled_seqs: list[Sequence]):
         if not self.block_manager.can_allocate(seq):
             return False
@@ -373,3 +449,23 @@ class Scheduler:
         self.running.append(seq)
         scheduled_seqs.append(seq)
         return True
+
+
+class BaseModelRunner(ABC):
+    @abstractmethod
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        raise NotImplementedError(f"{type(self)} is not implemented")
+    
+    @abstractmethod
+    def exit(self):
+        raise NotImplementedError(f"{type(self)} is not implemented")
+
+
+class ModelRunner(BaseModelRunner):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        pass
+
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        raise NotImplementedError(f"{type(self)} is not implemented")
+
+    def exit(self): pass
