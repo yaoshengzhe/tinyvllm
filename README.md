@@ -7,11 +7,21 @@ This project aims to build a lightweight inference engine for LLMs, keeping all 
 
 ## Installation
 
+You can install `tinyvllm` directly from GitHub:
+
 ```bash
-pip install -r requirements.txt
+pip install git+https://github.com/yaoshengzhe/tinyvllm.git
 ```
 
-## Model Download
+Or install dependencies for development:
+
+```bash
+pip install .
+```
+
+## Quick Start
+
+### 1. Download Model
 
 Before running the example, download the model from Hugging Face:
 
@@ -19,14 +29,7 @@ Before running the example, download the model from Hugging Face:
 huggingface-cli download Qwen/Qwen3-0.6B --local-dir models/Qwen3-0.6B --local-dir-use-symlinks False
 ```
 
-Or simply let `transformers` handle it automatically (cached in `~/.cache/huggingface`), but for explicit management:
-
-```bash
-pip install huggingface_hub
-huggingface-cli download Qwen/Qwen3-0.6B
-```
-
-## Usage
+### 2. Run Example
 
 ```bash
 python example.py
@@ -43,7 +46,7 @@ Ensure you have Python 3.8+ installed. It is recommended to use a virtual enviro
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install .
 ```
 
 ### Running the Example

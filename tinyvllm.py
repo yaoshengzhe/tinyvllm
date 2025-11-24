@@ -389,6 +389,9 @@ class AsyncLLMEngine(BaseLLMEngine):
         for process in self.ps:
             process.join()
 
+    def empty_cache(self):
+        self.model_runner.empty_cache()
+
     def generate(
         self, prompts: list[str] | list[list[int]], sampling_params: SamplingParams | list[SamplingParams], use_tqdm: bool = False
     ) -> list[RequestOutput]:
@@ -601,8 +604,13 @@ class ModelRunner(BaseModelRunner):
             del self.graphs, self.graph_pool
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         if self.world_size > 1:
             dist.destroy_process_group()
+
+    def empty_cache(self):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def loop(self):
         while True:
@@ -915,11 +923,11 @@ class ModelRunner(BaseModelRunner):
             
             # Warmup
             with torch.no_grad():
-                out = self.model(input_ids[:bs], position_ids=positions[:bs].unsqueeze(1))
+                out = self.model(input_ids[:bs].unsqueeze(1), position_ids=positions[:bs].unsqueeze(1))
                 outputs[:bs] = out.logits[:, -1, :]
             
             with torch.cuda.graph(graph, self.graph_pool):
-                out = self.model(input_ids[:bs], position_ids=positions[:bs].unsqueeze(1))
+                out = self.model(input_ids[:bs].unsqueeze(1), position_ids=positions[:bs].unsqueeze(1))
                 outputs[:bs] = out.logits[:, -1, :]
             
             if self.graph_pool is None:
