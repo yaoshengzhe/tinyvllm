@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import dataclass, fields
 from torch import nn
 from transformers import AutoConfig, AutoTokenizer
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional, Tuple
 
 
 import asyncio
@@ -25,6 +25,172 @@ from multiprocessing.shared_memory import SharedMemory
 
 DEFAULT_BLOCK_SIZE = 256
 END_OF_SEQ_TOKEN = -1
+
+def paged_attention_forward(self, *args, **kwargs):
+    # Extract arguments safely
+    hidden_states = args[0] if len(args) > 0 else kwargs.get("hidden_states")
+    attention_mask = args[1] if len(args) > 1 else kwargs.get("attention_mask")
+    # position_ids = args[2] if len(args) > 2 else kwargs.get("position_ids")
+    # past_key_values = args[3] if len(args) > 3 else kwargs.get("past_key_values")
+    # output_attentions = args[4] if len(args) > 4 else kwargs.get("output_attentions", False)
+    # use_cache = args[5] if len(args) > 5 else kwargs.get("use_cache", False)
+    
+    # 1. Q, K, V projection
+    b, s, _ = hidden_states.shape
+    q = self.q_proj(hidden_states)
+    k = self.k_proj(hidden_states)
+    v = self.v_proj(hidden_states)
+    
+    # Reshape for multi-head
+    # Qwen3 uses GQA. We need to get num_heads and head_dim.
+    # Based on previous print, q_proj out is 2048, k_proj out is 1024. head_dim is 128.
+    # So num_heads = 16, num_kv_heads = 8.
+    # We should get these from self if possible, or infer.
+    num_heads = self.num_heads if hasattr(self, "num_heads") else q.shape[-1] // 128
+    num_kv_heads = self.num_kv_heads if hasattr(self, "num_kv_heads") else k.shape[-1] // 128
+    head_dim = self.head_dim if hasattr(self, "head_dim") else 128
+
+    q = q.view(b, s, num_heads, head_dim)
+    k = k.view(b, s, num_kv_heads, head_dim)
+    v = v.view(b, s, num_kv_heads, head_dim)
+
+    # Apply layer norm if present (Qwen3 has q_norm, k_norm)
+    if hasattr(self, "q_norm"):
+        q = self.q_norm(q)
+    if hasattr(self, "k_norm"):
+        k = self.k_norm(k)
+
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    # RoPE
+    if "position_embeddings" in kwargs:
+        cos, sin = kwargs["position_embeddings"]
+        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+    
+    # KV Cache Storage
+    context = get_context()
+    if context and context.slot_mapping is not None and hasattr(torch, "tinyvllm_kv_cache"):
+        kv_cache = torch.tinyvllm_kv_cache
+        # kv_cache shape: [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        # We need layer_id. We can store it on the module during patching.
+        layer_id = self.layer_id
+        
+        # Store current K, V
+        # slot_mapping is [total_tokens] for prefill or [bs] for decode
+        # k, v are [bs, num_kv_heads, seq_len, head_dim] after transpose back or [bs, num_kv_heads, 1, head_dim] for decode
+        
+        # For simplicity, handle decode (s=1) first. Prefill is harder with slot_mapping.
+        # Actually, slot_mapping is prepared for both.
+        
+        # Flatten K, V for storage
+        # k is [b, num_kv_heads, s, head_dim] -> [b*s, num_kv_heads, head_dim]
+        k_flat = k.transpose(1, 2).reshape(-1, num_kv_heads, head_dim)
+        v_flat = v.transpose(1, 2).reshape(-1, num_kv_heads, head_dim)
+        
+        slots = context.slot_mapping
+        if slots.shape[0] == k_flat.shape[0]:
+            # Calculate block index and offset
+            block_size = kv_cache.shape[3]
+            block_ids = slots // block_size
+            offsets = slots % block_size
+            
+            # This is slow in Python, but works for now.
+            # Optimized version would use custom kernel or scatter.
+            for i in range(slots.shape[0]):
+                bid = block_ids[i]
+                off = offsets[i]
+                kv_cache[0, layer_id, bid, off] = k_flat[i]
+                kv_cache[1, layer_id, bid, off] = v_flat[i]
+
+        # Paged Attention (Retrieve and Compute)
+        if context.block_tables is not None:
+            # Decode path
+            # q is [b, num_heads, 1, head_dim]
+            # We need to collect K, V for all past tokens for each sequence in batch.
+            
+            output = torch.empty_like(q) # [b, num_heads, 1, head_dim]
+            
+            for i in range(b):
+                # Get block table for this sequence
+                block_table = context.block_tables[i] # [max_num_blocks]
+                actual_len = context.context_lens[i]
+                
+                # Collect K, V blocks
+                # This is also slow in Python.
+                num_blocks = (actual_len + block_size - 1) // block_size
+                valid_blocks = block_table[:num_blocks]
+                
+                # Gather blocks
+                # kv_cache[0, layer_id, valid_blocks] -> [num_blocks, block_size, num_kv_heads, head_dim]
+                k_blocks = kv_cache[0, layer_id, valid_blocks]
+                v_blocks = kv_cache[1, layer_id, valid_blocks]
+                
+                # Flatten blocks and truncate to actual_len
+                k_full = k_blocks.view(-1, num_kv_heads, head_dim)[:actual_len]
+                v_full = v_blocks.view(-1, num_kv_heads, head_dim)[:actual_len]
+                
+                # Compute attention for this sequence
+                # q_i is [num_heads, 1, head_dim]
+                q_i = q[i] 
+                
+                # Repeat K, V for GQA if needed
+                # num_heads = 16, num_kv_heads = 8. Repeat factor = 2.
+                if num_heads != num_kv_heads:
+                    k_full = k_full.repeat_interleave(num_heads // num_kv_heads, dim=1)
+                    v_full = v_full.repeat_interleave(num_heads // num_kv_heads, dim=1)
+                
+                # k_full is [actual_len, num_heads, head_dim]
+                # v_full is [actual_len, num_heads, head_dim]
+                
+                # Attention scores
+                # q_i: [num_heads, 1, head_dim]
+                # k_full: [actual_len, num_heads, head_dim] -> [num_heads, actual_len, head_dim]
+                scores = torch.matmul(q_i, k_full.transpose(0, 1).transpose(1, 2)) / (head_dim ** 0.5)
+                # scores is [num_heads, 1, actual_len]
+                
+                if attention_mask is not None:
+                    # Handle mask if needed, but for decode it's usually all 1s for past
+                    pass
+                
+                probs = torch.softmax(scores, dim=-1)
+                
+                # Output
+                # probs: [num_heads, 1, actual_len]
+                # v_full: [num_heads, actual_len, head_dim]
+                out_i = torch.matmul(probs, v_full.transpose(0, 1))
+                # out_i is [num_heads, 1, head_dim]
+                output[i] = out_i
+            
+            output = output.transpose(1, 2).reshape(b, s, -1)
+            output = self.o_proj(output)
+            return output, None, None
+        else:
+            # Prefill path or no cache
+            # Use standard attention
+            # For prefill, we still need to handle GQA and RoPE which we already did.
+            # But we can use efficient_attention if available, or standard.
+            
+            # Standard attention
+            if num_heads != num_kv_heads:
+                k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
+                v = v.repeat_interleave(num_heads // num_kv_heads, dim=1)
+            
+            scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
+            if attention_mask is not None:
+                scores = scores + attention_mask
+            probs = torch.softmax(scores, dim=-1)
+            output = torch.matmul(probs, v)
+            output = output.transpose(1, 2).reshape(b, s, -1)
+            output = self.o_proj(output)
+            return output, None, None
+
+    # Fallback if no cache or not patched
+    # This should not happen if patched correctly
+    return self.original_forward(*args, **kwargs)
+
 
 @dataclass
 class Context:
@@ -565,6 +731,9 @@ class ModelRunner(BaseModelRunner):
         if torch.cuda.is_available():
             torch.set_default_device("cuda")
         
+        if torch.cuda.is_available():
+            torch.set_default_device("cuda")
+        
         # Fallback to AutoModelForCausalLM if Qwen3ForCausalLM is not available
         import warnings
         from transformers import AutoModelForCausalLM
@@ -577,6 +746,23 @@ class ModelRunner(BaseModelRunner):
             )
         self.sampler = Sampler()
         
+        # Patch Attention Layers
+        layer_id = 0
+        for module in self.model.modules():
+            if "Qwen3Attention" in module.__class__.__name__:
+                module.layer_id = layer_id
+                module.original_forward = module.forward
+                import types
+                module.forward = types.MethodType(paged_attention_forward, module)
+                # Set necessary attributes if missing
+                if not hasattr(module, "num_heads"):
+                    module.num_heads = module.q_proj.out_features // 128 # Assuming head_dim=128
+                if not hasattr(module, "num_kv_heads"):
+                    module.num_kv_heads = module.k_proj.out_features // 128
+                if not hasattr(module, "head_dim"):
+                    module.head_dim = 128
+                layer_id += 1
+
         if torch.cuda.is_available():
             self.warmup_model()
             self.allocate_kv_cache()
@@ -694,6 +880,7 @@ class ModelRunner(BaseModelRunner):
             config.num_kvcache_blocks = 1 # Minimum 1 block
         
         self.kv_cache = torch.empty(2, num_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, device="cuda")
+        torch.tinyvllm_kv_cache = self.kv_cache
         
         # Note: In standard AutoModelForCausalLM, we don't easily have access to set k_cache/v_cache 
         # on modules without custom model implementation. We keep the allocation for now.
@@ -788,7 +975,21 @@ class ModelRunner(BaseModelRunner):
         block_tables = self.prepare_block_tables(seqs)
         
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens_tensor, block_tables=block_tables)
-        return input_ids, positions, attention_mask
+        
+        # For patched attention, we only want the last token for decode
+        # But we need to make sure positions are correct.
+        # In decode, we pass [bs, 1] input_ids and [bs, 1] positions.
+        last_input_ids = []
+        last_positions = []
+        for seq in seqs:
+            last_input_ids.append([seq.token_ids[-1]])
+            last_positions.append([len(seq.token_ids) - 1])
+        
+        input_ids = torch.tensor(last_input_ids, dtype=torch.int64, device=self.device)
+        positions = torch.tensor(last_positions, dtype=torch.int64, device=self.device)
+        # Mask is not needed for single token decode with PagedAttention as we handle it.
+        
+        return input_ids, positions, None
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
@@ -814,20 +1015,9 @@ class ModelRunner(BaseModelRunner):
                     outputs = self.model(input_ids.unsqueeze(0), position_ids=positions.unsqueeze(0))
                     return outputs.logits
             else:
-                # Decode fallback: input_ids is [bs, seq_len]
+                # Decode fallback: input_ids is [bs, 1] due to prepare_decode change
                 outputs = self.model(input_ids, position_ids=positions, attention_mask=attention_mask)
-                # We need to extract the last token for each sequence based on context_lens
-                context = get_context()
-                if context and context.context_lens is not None:
-                    # context_lens is [bs]
-                    bs = input_ids.size(0)
-                    last_token_logits = []
-                    for i in range(bs):
-                        last_pos = context.context_lens[i] - 1
-                        last_token_logits.append(outputs.logits[i, last_pos, :])
-                    return torch.stack(last_token_logits)
-                else:
-                    return outputs.logits[:, -1, :]
+                return outputs.logits[:, -1, :]
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -883,7 +1073,7 @@ class ModelRunner(BaseModelRunner):
                         # Fallback: if mismatch, just take the last token of the whole chunk
                         # This might be wrong for multiple sequences but prevents crash
                         logits = logits[-1:, :] 
-            
+
             token_ids = self.sampler(logits, temperatures).tolist()
         else:
             token_ids = None
@@ -923,11 +1113,11 @@ class ModelRunner(BaseModelRunner):
             
             # Warmup
             with torch.no_grad():
-                out = self.model(input_ids[:bs].unsqueeze(1), position_ids=positions[:bs].unsqueeze(1))
+                out = self.model(input_ids[:bs].unsqueeze(1))
                 outputs[:bs] = out.logits[:, -1, :]
             
             with torch.cuda.graph(graph, self.graph_pool):
-                out = self.model(input_ids[:bs].unsqueeze(1), position_ids=positions[:bs].unsqueeze(1))
+                out = self.model(input_ids[:bs].unsqueeze(1))
                 outputs[:bs] = out.logits[:, -1, :]
             
             if self.graph_pool is None:
