@@ -48,7 +48,7 @@ class TestKVCache(unittest.TestCase):
         sin = torch.randn(s, 64)
         
         with patch('transformers.models.qwen3.modeling_qwen3.apply_rotary_pos_emb', return_value=(torch.randn(b, 4, s, 64), torch.randn(b, 2, s, 64))):
-            out, _, _ = self.module.forward(hidden_states, position_embeddings=(cos, sin))
+            out, _ = self.module.forward(hidden_states, position_embeddings=(cos, sin))
             
         self.assertEqual(out.shape, (b, s, 256))
         # Check if KV cache was updated (simplified check)
@@ -73,7 +73,7 @@ class TestKVCache(unittest.TestCase):
         sin = torch.randn(s, 64)
         
         with patch('transformers.models.qwen3.modeling_qwen3.apply_rotary_pos_emb', return_value=(torch.randn(b, 4, s, 64), torch.randn(b, 2, s, 64))):
-            out, _, _ = self.module.forward(hidden_states, position_embeddings=(cos, sin))
+            out, _ = self.module.forward(hidden_states, position_embeddings=(cos, sin))
             
         self.assertEqual(out.shape, (b, s, 256))
         # Check if 6th token was stored
@@ -104,7 +104,7 @@ class TestKVCache(unittest.TestCase):
         sin = torch.randn(s, 64)
         
         with patch('transformers.models.qwen3.modeling_qwen3.apply_rotary_pos_emb', return_value=(torch.randn(b, 4, s, 64), torch.randn(b, 2, s, 64))):
-            out, _, _ = self.module.forward(hidden_states, position_embeddings=(cos, sin))
+            out, _ = self.module.forward(hidden_states, position_embeddings=(cos, sin))
             
         self.assertEqual(out.shape, (b, s, 256))
         # Check if tokens were stored
@@ -134,7 +134,7 @@ class TestKVCache(unittest.TestCase):
         sin = torch.randn(s, 64)
         
         with patch('transformers.models.qwen3.modeling_qwen3.apply_rotary_pos_emb', return_value=(torch.randn(b, 4, s, 64), torch.randn(b, 2, s, 64))):
-            out, _, _ = self.module.forward(hidden_states, position_embeddings=(cos, sin))
+            out, _ = self.module.forward(hidden_states, position_embeddings=(cos, sin))
             
         self.assertEqual(out.shape, (b, s, 256))
         # Check if 17th token was stored in block 1, offset 0

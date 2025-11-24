@@ -166,7 +166,7 @@ def paged_attention_forward(self, *args, **kwargs):
             
             output = output.transpose(1, 2).reshape(b, s, -1)
             output = self.o_proj(output)
-            return output, None, None
+            return output, None
         else:
             # Prefill path or no cache
             # Use standard attention
@@ -185,7 +185,7 @@ def paged_attention_forward(self, *args, **kwargs):
             output = torch.matmul(probs, v)
             output = output.transpose(1, 2).reshape(b, s, -1)
             output = self.o_proj(output)
-            return output, None, None
+            return output, None
 
     # Fallback if no cache or not patched
     # This should not happen if patched correctly
@@ -1008,15 +1008,15 @@ class ModelRunner(BaseModelRunner):
                         start, end = cu_seqlens_q[i], cu_seqlens_q[i+1]
                         seq_input_ids = input_ids[start:end].unsqueeze(0)
                         seq_positions = positions[start:end].unsqueeze(0)
-                        out = self.model(seq_input_ids, position_ids=seq_positions)
+                        out = self.model(seq_input_ids)
                         all_logits.append(out.logits)
                     return torch.cat(all_logits, dim=1) # [1, sum_seq_len, vocab_size]
                 else:
-                    outputs = self.model(input_ids.unsqueeze(0), position_ids=positions.unsqueeze(0))
+                    outputs = self.model(input_ids.unsqueeze(0))
                     return outputs.logits
             else:
                 # Decode fallback: input_ids is [bs, 1] due to prepare_decode change
-                outputs = self.model(input_ids, position_ids=positions, attention_mask=attention_mask)
+                outputs = self.model(input_ids, attention_mask=attention_mask)
                 return outputs.logits[:, -1, :]
         else:
             bs = input_ids.size(0)
@@ -1025,7 +1025,7 @@ class ModelRunner(BaseModelRunner):
             suitable_bs = next((x for x in self.graph_bs if x >= bs), None)
             if suitable_bs is None:
                 # Fallback if batch size too large for graphs
-                outputs = self.model(input_ids.unsqueeze(1), position_ids=positions.unsqueeze(1))
+                outputs = self.model(input_ids.unsqueeze(1))
                 return outputs.logits[:, -1, :]
                 
             graph = self.graphs[suitable_bs]
