@@ -14,7 +14,7 @@ prompts = [
 ]
 
 # Define sampling parameters
-sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=16)
 
 # Initialize the LLM engine with the Qwen model
 # huggingface-cli download Qwen/Qwen3-0.6B --local-dir models/Qwen3-0.6B --local-dir-use-symlinks False
